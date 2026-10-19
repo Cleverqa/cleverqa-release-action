@@ -4,7 +4,7 @@ Declares a release to [CleverQA](https://cleverqa.com) from your CI, so crashes 
 
 ```yaml
 - name: Declare release to CleverQA
-  uses: clementina-enterprises/cleverqa-release-action@v1
+  uses: Cleverqa/cleverqa-release-action@v1
   with:
     api-token: ${{ secrets.CLEVERQA_TOKEN }}
     project: my-project
@@ -33,7 +33,7 @@ jobs:
 
       - name: Declare release to CleverQA
         id: cleverqa
-        uses: clementina-enterprises/cleverqa-release-action@v1
+        uses: Cleverqa/cleverqa-release-action@v1
         with:
           api-token: ${{ secrets.CLEVERQA_TOKEN }}
           project: my-project
