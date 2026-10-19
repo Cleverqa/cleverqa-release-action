@@ -1,0 +1,175 @@
+name: test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mock:
+    name: mock endpoint (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    env:
+      MOCK_URL: http://127.0.0.1:8787
+      GOOD_TOKEN: tok_mockGoodToken0123456789
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start mock CleverQA API
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/mock.py" <<'PY'
+          import json, os, sys
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+
+          GOOD = os.environ["GOOD_TOKEN"]
+          LOG = os.path.join(os.environ["RUNNER_TEMP"], "requests.jsonl")
+          seen = set()
+
+          class H(BaseHTTPRequestHandler):
+              def log_message(self, *a): pass
+              def reply(self, code, payload):
+                  data = json.dumps(payload).encode()
+                  self.send_response(code)
+                  self.send_header("Content-Type", "application/json")
+                  self.send_header("Content-Length", str(len(data)))
+                  self.end_headers()
+                  self.wfile.write(data)
+              def do_POST(self):
+                  raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                  auth = self.headers.get("Authorization", "")
+                  with open(LOG, "a") as f:
+                      f.write(json.dumps({"path": self.path, "auth": auth, "body": raw.decode()}) + "\n")
+                  if self.path != "/api/v1/releases":
+                      return self.reply(404, {"error": {"code": "NOT_FOUND", "message": "no route"}})
+                  if auth != "Bearer " + GOOD:
+                      return self.reply(401, {"error": {"code": "API_TOKEN_INVALID", "message": "Token is invalid, revoked, or expired."}})
+                  body = json.loads(raw)
+                  if body.get("project") == "missing":
+                      return self.reply(404, {"error": {"code": "PROJECT_NOT_FOUND", "message": "no project 'missing' in this tenant"}})
+                  key = (body["project"], body["version"], body["platform"])
+                  created = key not in seen
+                  seen.add(key)
+                  self.reply(201 if created else 200, {"data": {"id": "rel_mock_" + body["version"], "version": body["version"]}, "meta": {"created": created}})
+
+          HTTPServer(("127.0.0.1", 8787), H).serve_forever()
+          PY
+          py="$(command -v python3 || command -v python)"
+          "$py" "$RUNNER_TEMP/mock.py" > "$RUNNER_TEMP/mock.log" 2>&1 &
+          for i in $(seq 1 30); do
+            curl -s -o /dev/null -X POST "$MOCK_URL/ping" && exit 0
+            sleep 1
+          done
+          echo "mock did not start"; cat "$RUNNER_TEMP/mock.log"; exit 1
+
+      - name: Declare (tag-style version, awkward characters)
+        id: ok
+        uses: ./
+        with:
+          api-token: ${{ env.GOOD_TOKEN }}
+          project: my-project
+          version: v1.4.2-rc.1+build.7
+          build-number: '42 "quoted" $(not-run) `nor-this`'
+          api-url: ${{ env.MOCK_URL }}/
+
+      - name: Check output and request body
+        shell: bash
+        env:
+          RELEASE_ID: ${{ steps.ok.outputs.release-id }}
+        run: |
+          set -euo pipefail
+          test "$RELEASE_ID" = "rel_mock_1.4.2-rc.1+build.7"
+          req="$(grep '"/api/v1/releases"' "$RUNNER_TEMP/requests.jsonl" | tail -1)"
+          body="$(jq -r .body <<<"$req")"
+          test "$(jq -r .auth <<<"$req")" = "Bearer $GOOD_TOKEN"
+          test "$(jq -r .version <<<"$body")" = "1.4.2-rc.1+build.7"
+          test "$(jq -r .platform <<<"$body")" = "backend"
+          test "$(jq -r .buildNumber <<<"$body")" = '42 "quoted" $(not-run) `nor-this`'
+          # Empty optional inputs are omitted, not sent as "" or null.
+          test "$(jq -c 'keys' <<<"$body")" = '["buildNumber","platform","project","version"]'
+
+      - name: Declare again (idempotent, 200)
+        id: again
+        uses: ./
+        with:
+          api-token: ${{ env.GOOD_TOKEN }}
+          project: my-project
+          version: v1.4.2-rc.1+build.7
+          api-url: ${{ env.MOCK_URL }}
+
+      - name: Check repeat returns the same id
+        shell: bash
+        run: test "${{ steps.again.outputs.release-id }}" = "${{ steps.ok.outputs.release-id }}"
+
+      - name: Bad token must fail
+        id: badtoken
+        continue-on-error: true
+        uses: ./
+        with:
+          api-token: tok_wrong
+          project: my-project
+          version: 1.0.0
+          api-url: ${{ env.MOCK_URL }}
+
+      - name: Unknown project must fail
+        id: badproject
+        continue-on-error: true
+        uses: ./
+        with:
+          api-token: ${{ env.GOOD_TOKEN }}
+          project: missing
+          version: 1.0.0
+          api-url: ${{ env.MOCK_URL }}
+
+      - name: Unreachable API must fail
+        id: unreachable
+        continue-on-error: true
+        uses: ./
+        with:
+          api-token: ${{ env.GOOD_TOKEN }}
+          project: my-project
+          version: 1.0.0
+          api-url: http://127.0.0.1:9
+
+      - name: Check every failure case failed
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ steps.badtoken.outcome }}" = failure
+          test "${{ steps.badproject.outcome }}" = failure
+          test "${{ steps.unreachable.outcome }}" = failure
+          test -z "${{ steps.badtoken.outputs.release-id }}"
+
+  live:
+    # Real call against CleverQA. Runs only when the repo has the
+    # CLEVERQA_TEST_TOKEN secret and CLEVERQA_TEST_PROJECT variable set.
+    name: live endpoint
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    env:
+      HAS_TOKEN: ${{ secrets.CLEVERQA_TEST_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        if: env.HAS_TOKEN == 'true'
+      - id: live
+        if: env.HAS_TOKEN == 'true'
+        uses: ./
+        with:
+          api-token: ${{ secrets.CLEVERQA_TEST_TOKEN }}
+          project: ${{ vars.CLEVERQA_TEST_PROJECT }}
+          version: 0.0.1-action-test
+          platform: ${{ vars.CLEVERQA_TEST_PLATFORM || 'backend' }}
+          status: draft
+          notes: cleverqa-release-action CI check
+      - if: env.HAS_TOKEN == 'true'
+        shell: bash
+        run: test -n "${{ steps.live.outputs.release-id }}"
+      - if: env.HAS_TOKEN != 'true'
+        run: echo "CLEVERQA_TEST_TOKEN not set; live check skipped"

@@ -1,0 +1,142 @@
+# Releasing: tag the commit vX.Y.Z, create a GitHub Release from it, then move
+# the major tag so users pinned to @vX get the fix:
+#   git tag -a v1.0.1 -m "..." && git push origin v1.0.1
+#   git tag -f v1 v1.0.1 && git push -f origin v1
+# Never move v1 to a change that breaks existing inputs; that is a v2.
+
+name: 'CleverQA Release'
+description: 'Declare a release to CleverQA so crashes and incidents attribute to it'
+author: 'Clementina Enterprises'
+
+branding:
+  icon: 'activity'
+  color: 'green'
+
+inputs:
+  api-token:
+    description: 'CleverQA API token (tok_...) with the releases:write scope'
+    required: true
+  project:
+    description: 'CleverQA project slug, as it appears in the project URL'
+    required: true
+  version:
+    description: 'Release version in semver, e.g. 1.4.2. One leading "v" is stripped, so v1.4.2 works.'
+    required: true
+  platform:
+    description: 'ios, android or backend'
+    required: false
+    default: 'backend'
+  build-number:
+    description: 'Build number, if you have one'
+    required: false
+    default: ''
+  status:
+    description: 'draft, testing, ready, released or rolled_back. CleverQA defaults to released.'
+    required: false
+    default: ''
+  notes:
+    description: 'Release notes, up to 5000 characters'
+    required: false
+    default: ''
+  api-url:
+    description: 'CleverQA base URL. Only change this for self-hosted.'
+    required: false
+    default: 'https://cleverqa.com'
+
+outputs:
+  release-id:
+    description: 'The CleverQA release ID'
+    value: ${{ steps.declare.outputs.release-id }}
+
+runs:
+  using: 'composite'
+  steps:
+    - id: declare
+      shell: bash
+      # Inputs arrive through env, never interpolated into the script, so a
+      # version or note containing quotes or $(...) cannot run as shell.
+      env:
+        CQ_TOKEN: ${{ inputs.api-token }}
+        CQ_PROJECT: ${{ inputs.project }}
+        CQ_VERSION: ${{ inputs.version }}
+        CQ_PLATFORM: ${{ inputs.platform }}
+        CQ_BUILD_NUMBER: ${{ inputs.build-number }}
+        CQ_STATUS: ${{ inputs.status }}
+        CQ_NOTES: ${{ inputs.notes }}
+        CQ_API_URL: ${{ inputs.api-url }}
+      run: |
+        set -euo pipefail
+
+        fail() { echo "::error title=CleverQA release not declared::$1"; exit 1; }
+
+        for bin in curl jq; do
+          command -v "$bin" >/dev/null 2>&1 || fail "'$bin' is not installed on this runner; install it before this step"
+        done
+
+        [ -n "$CQ_TOKEN" ] || fail "api-token is empty. Is the secret set and available to this workflow?"
+        echo "::add-mask::$CQ_TOKEN"
+        [ -n "$CQ_PROJECT" ] || fail "project is empty"
+        version="${CQ_VERSION#[vV]}"
+        [ -n "$version" ] || fail "version is empty"
+
+        body="$(jq -n \
+          --arg project "$CQ_PROJECT" \
+          --arg version "$version" \
+          --arg platform "$CQ_PLATFORM" \
+          --arg buildNumber "$CQ_BUILD_NUMBER" \
+          --arg status "$CQ_STATUS" \
+          --arg notes "$CQ_NOTES" \
+          '{project: $project, version: $version, platform: $platform,
+            buildNumber: $buildNumber, status: $status, notes: $notes}
+           | with_entries(select(.value != ""))')"
+
+        # The token goes in a header file, not on the curl command line, so it
+        # never shows in a process listing on a shared self-hosted runner.
+        work="$(mktemp -d "${RUNNER_TEMP:-/tmp}/cleverqa.XXXXXX")"
+        trap 'rm -rf "$work"' EXIT
+        umask 077
+        printf 'Authorization: Bearer %s\n' "$CQ_TOKEN" > "$work/headers"
+        printf '%s' "$body" > "$work/body.json"
+
+        url="${CQ_API_URL%/}/api/v1/releases"
+        echo "Declaring $CQ_PROJECT $version ($CQ_PLATFORM) to ${CQ_API_URL%/}"
+
+        # No --fail: it discards the response body, and the body holds the
+        # reason. The status code is checked below instead. POST is safe to
+        # retry: CleverQA treats (project, version, platform) as one release.
+        status="$(curl --silent --show-error --location --max-time 30 --retry 2 \
+          --request POST \
+          --header @"$work/headers" \
+          --header 'Content-Type: application/json' \
+          --header 'Accept: application/json' \
+          --data-binary @"$work/body.json" \
+          --output "$work/response" \
+          --write-out '%{http_code}' \
+          "$url")" || fail "could not reach $url (curl exit $?)"
+
+        if [ "$status" -lt 200 ] || [ "$status" -ge 300 ]; then
+          echo "HTTP $status from $url"
+          if reason="$(jq -er '.error | "\(.code): \(.message)"' "$work/response" 2>/dev/null)"; then
+            echo "$reason"
+          else
+            head -c 2000 "$work/response"; echo
+          fi
+          case "$status" in
+            401) hint="check the token is current and not revoked" ;;
+            402) hint="declaring releases needs the Essentials plan or above" ;;
+            403) hint="the token needs the releases:write scope" ;;
+            404) hint="no project with slug '$CQ_PROJECT' in the token's workspace" ;;
+            *)   hint="see the response above" ;;
+          esac
+          fail "HTTP $status: $hint"
+        fi
+
+        id="$(jq -r '.data.id // empty' "$work/response" 2>/dev/null || true)"
+        [ -n "$id" ] || fail "HTTP $status but the response had no release id: $(head -c 500 "$work/response")"
+
+        if [ "$(jq -r '.meta.created' "$work/response")" = "true" ]; then
+          echo "Created release $id"
+        else
+          echo "Release already existed; updated $id"
+        fi
+        echo "release-id=$id" >> "$GITHUB_OUTPUT"
